@@ -38,8 +38,10 @@ import org.w3c.dom.Element
 import java.io.File
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
+import java.nio.file.attribute.BasicFileAttributes
+import java.nio.file.attribute.FileTime
 import java.util.logging.Logger
-import kotlin.time.measureTimedValue
+import kotlin.time.measureTime
 
 internal class ArsclibResourceCoder(
     internal val workingDir: File,
@@ -62,10 +64,16 @@ internal class ArsclibResourceCoder(
     internal val deletedFiles = mutableSetOf<String>()
 
     /**
-     * Snapshot of file metadata (modification time and size) captured after decoding resources.
-     * Used to detect which files were added or modified between decoding and encoding.
+     * Snapshot of file metadata and identity captured after decoding resources.
+     * High-resolution timestamps and file keys catch same-size rewrites and replacement files without rereading every
+     * decoded resource payload.
      */
-    internal data class FileSnapshot(val lastModified: Long, val size: Long)
+    internal class FileSnapshot(
+        val creationTime: FileTime,
+        val lastModified: FileTime,
+        val size: Long,
+        val fileKey: Any?,
+    )
     internal var fileSnapshotCache: Map<File, FileSnapshot> = emptyMap()
     internal var pathMap: PathMap = PathMap.EMPTY
 
@@ -75,10 +83,10 @@ internal class ArsclibResourceCoder(
     internal fun buildFileSnapshot(): Map<File, FileSnapshot> {
         val snapshot = mutableMapOf<File, FileSnapshot>()
         workingDir.resolve("resources").walkTopDown().filter { it.isFile }.forEach { file ->
-            snapshot[file] = FileSnapshot(file.lastModified(), file.length())
+            snapshot[file] = file.snapshot()
         }
         workingDir.resolve("root").walkTopDown().filter { it.isFile }.forEach { file ->
-            snapshot[file] = FileSnapshot(file.lastModified(), file.length())
+            snapshot[file] = file.snapshot()
         }
         return snapshot
     }
@@ -98,7 +106,7 @@ internal class ArsclibResourceCoder(
                 if (excludedPaths.contains(relativePath)) return@forEach
 
                 val cached = fileSnapshotCache[file]
-                if (cached == null || file.lastModified() != cached.lastModified || file.length() != cached.size) {
+                if (file.differsFrom(cached)) {
                     modifiedResResources.add(file)
                 }
             }
@@ -106,7 +114,7 @@ internal class ArsclibResourceCoder(
 
         otherResourcesRootDirectory.walkTopDown().filter { it.isFile }.forEach { file ->
             val cached = fileSnapshotCache[file]
-            if (cached == null || file.lastModified() != cached.lastModified || file.length() != cached.size) {
+            if (file.differsFrom(cached)) {
                 modifiedBinaryResources.add(file)
             }
         }
@@ -298,9 +306,9 @@ internal class ArsclibResourceCoder(
         val encoder = ApkModuleXmlEncoder()
         encoder.apkModule.use { loadedModule ->
             loadedModule.setPreferredFramework(lazyPackageInfo.value.frameworkVersion)
-            val scanDuration = measureTimedValue {
+            val scanDuration = measureTime {
                 encoder.scanDirectory(workingDir)
-            }.duration
+            }
 
             ApkModule.loadApkFile(apkFile).use { originalModule ->
                 val changedEntries = changedArchiveEntries(originalPackageName != newPackageName)
@@ -312,9 +320,9 @@ internal class ArsclibResourceCoder(
                             "rebuilding $rebuiltEntries entries",
                 )
 
-                val writeDuration = measureTimedValue {
+                val writeDuration = measureTime {
                     loadedModule.writeApk(outputApk)
-                }.duration
+                }
 
                 logger.info("Resource APK timings: scan=$scanDuration, write=$writeDuration")
             }
@@ -382,6 +390,25 @@ internal class ArsclibResourceCoder(
 
         val alias = basePath.relativize(filePath).toString().replace(File.separatorChar, '/')
         return pathMap.getOriginalName(alias) ?: alias
+    }
+
+    private fun File.snapshot(): FileSnapshot {
+        val attributes = Files.readAttributes(toPath(), BasicFileAttributes::class.java)
+        return FileSnapshot(
+            attributes.creationTime(),
+            attributes.lastModifiedTime(),
+            attributes.size(),
+            attributes.fileKey(),
+        )
+    }
+
+    private fun File.differsFrom(snapshot: FileSnapshot?): Boolean {
+        if (snapshot == null) return true
+        val attributes = Files.readAttributes(toPath(), BasicFileAttributes::class.java)
+        return attributes.creationTime() != snapshot.creationTime ||
+                attributes.lastModifiedTime() != snapshot.lastModified ||
+                attributes.size() != snapshot.size ||
+                attributes.fileKey() != snapshot.fileKey
     }
 
     override fun getOtherResourceFiles(outputDir: File, resourceMode: ResourceMode): File? {
