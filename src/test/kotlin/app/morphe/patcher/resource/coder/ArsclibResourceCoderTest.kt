@@ -19,6 +19,17 @@ import java.io.File
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
+import com.reandroid.apk.ApkModule
+import com.reandroid.archive.FileInputSource
+import com.reandroid.archive.io.ArchiveFileEntrySource
+import org.junit.jupiter.api.Assumptions.assumeTrue
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption
+import java.nio.file.attribute.BasicFileAttributes
+import java.nio.file.attribute.FileTime
+import java.util.concurrent.TimeUnit
+import java.util.zip.ZipFile
+import kotlin.test.assertIs
 
 internal class ArsclibResourceCoderTest {
 
@@ -230,6 +241,107 @@ internal class ArsclibResourceCoderTest {
 
         assertTrue(coder.modifiedResResources.isEmpty(), "No files should be in modifiedResResources")
         assertTrue(coder.modifiedBinaryResources.isEmpty(), "No files should be in modifiedBinaryResources")
+    }
+
+            // ==================== resource APK input reuse tests ====================
+
+    @Test
+    fun `changedArchiveEntries maps decoded aliases back to original APK paths`() {
+        val packageDir = setupPackageDir()
+        val modifiedResource = packageDir.resolve("res/layout/readable.xml").apply {
+            parentFile.mkdirs()
+            writeText("<LinearLayout/>")
+        }
+        val modifiedBinary = coder.otherResourcesRootDirectory.resolve("assets/readable.bin").apply {
+            parentFile.mkdirs()
+            writeBytes(byteArrayOf(1, 2, 3))
+        }
+        coder.pathMap = PathMap(
+            """[
+                {"name":"res/a.xml","alias":"res/layout/readable.xml"},
+                {"name":"assets/b.bin","alias":"assets/readable.bin"}
+            ]""".trimIndent(),
+        )
+        coder.modifiedResResources += modifiedResource
+        coder.modifiedBinaryResources += modifiedBinary
+
+        val changedEntries = coder.changedArchiveEntries()
+
+        assertEquals(
+            setOf("AndroidManifest.xml", "resources.arsc", "res/a.xml", "assets/b.bin"),
+            changedEntries,
+        )
+    }
+
+    @Test
+    fun `changedArchiveEntries rebuilds only resources reported as modified`() {
+        val packageDir = setupPackageDir()
+        val unchanged = packageDir.resolve("res/layout/unchanged.xml").apply {
+            parentFile.mkdirs()
+            writeText("<LinearLayout/>")
+        }
+        val changed = packageDir.resolve("res/drawable/changed.png").apply {
+            parentFile.mkdirs()
+            writeBytes(byteArrayOf(1, 2, 3))
+        }
+        coder.modifiedResResources += changed
+
+        val changedEntries = coder.changedArchiveEntries()
+
+        assertFalse(unchanged.relativeTo(packageDir).invariantSeparatorsPath in changedEntries)
+        assertTrue("res/drawable/changed.png" in changedEntries)
+    }
+
+    @Test
+    fun `reuseUnchangedArchiveEntries preserves changed and new encoder inputs`(@TempDir tempDir: File) {
+        val originalApk = tempDir.resolve("original.apk")
+        ZFile.openReadWrite(originalApk).use { zip ->
+            zip.add("unchanged.bin", ByteArrayInputStream("original unchanged".toByteArray()))
+            zip.add("changed.bin", ByteArrayInputStream("original changed".toByteArray()))
+            zip.add("deleted.bin", ByteArrayInputStream("deleted".toByteArray()))
+        }
+
+        val encodedModule = ApkModule()
+        val unchangedFile = tempDir.resolve("unchanged.bin").apply { writeText("filesystem unchanged") }
+        val changedFile = tempDir.resolve("changed.bin").apply { writeText("patched changed") }
+        val newFile = tempDir.resolve("new.bin").apply { writeText("new") }
+        encodedModule.add(FileInputSource(unchangedFile, "unchanged.bin"))
+        encodedModule.add(FileInputSource(changedFile, "changed.bin"))
+        encodedModule.add(FileInputSource(newFile, "new.bin"))
+
+        val testCoder = ArsclibResourceCoder(tempDir.resolve("working").apply { mkdirs() }, originalApk)
+        ApkModule.loadApkFile(originalApk).use { originalModule ->
+            encodedModule.use { module ->
+                val reused = testCoder.reuseUnchangedArchiveEntries(
+                    originalModule,
+                    module,
+                    setOf("changed.bin"),
+                )
+
+                // Unchanged entries are reused whether or not the encoder staged them, so the
+                // entry a patch deleted is carried here too; applyTo's deletion pass drops it.
+                assertEquals(2, reused)
+                assertIs<ArchiveFileEntrySource>(module.zipEntryMap.getInputSource("unchanged.bin"))
+                assertIs<FileInputSource>(module.zipEntryMap.getInputSource("changed.bin"))
+                assertIs<FileInputSource>(module.zipEntryMap.getInputSource("new.bin"))
+                assertIs<ArchiveFileEntrySource>(module.zipEntryMap.getInputSource("deleted.bin"))
+
+                val outputApk = tempDir.resolve("output.apk")
+                module.writeApk(outputApk)
+                ZipFile(outputApk).use { zip ->
+                    assertEquals(
+                        "original unchanged",
+                        zip.getInputStream(zip.getEntry("unchanged.bin")).bufferedReader().readText(),
+                    )
+                    assertEquals(
+                        "patched changed",
+                        zip.getInputStream(zip.getEntry("changed.bin")).bufferedReader().readText(),
+                    )
+                    assertEquals("new", zip.getInputStream(zip.getEntry("new.bin")).bufferedReader().readText())
+                    assertEquals("deleted", zip.getInputStream(zip.getEntry("deleted.bin")).bufferedReader().readText())
+                }
+            }
+        }
     }
 
     @Test
