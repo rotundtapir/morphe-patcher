@@ -37,9 +37,6 @@ object ApkUtils {
     // Alignment for all other files.
     private const val DEFAULT_ALIGNMENT = 4
 
-    // Prefix for resources.
-    private const val RES_PREFIX = "res/"
-
     /**
      * apkzlib's default compressor runs every deflate on the calling thread, so writing the dex
      * files and the uncompiled resources is serialised on one core. [ZFile] assigns entry offsets
@@ -66,12 +63,11 @@ object ApkUtils {
      * Applies the [PatcherResult] to the given [apkFile].
      *
      * The order of operation is as follows:
-     * 1. Delete all resources in the target APK.
-     * 2. Merge resources.apk compiled by AAPT.
-     * 3. Write raw resources.
-     * 4. Delete resources staged for deletion.
-     * 5. Write patched dex files.
-     * 6. Realign the APK.
+     * 1. Merge resources.apk compiled by AAPT over the target's existing resources.
+     * 2. Write raw resources.
+     * 3. Delete resources staged for deletion.
+     * 4. Write patched dex files.
+     * 5. Realign the APK.
      *
      * @param apkFile The file to apply the patched files to.
      */
@@ -92,14 +88,16 @@ object ApkUtils {
                 // Add resources compiled by AAPT.
                 resources.resourcesApk?.let { resourcesApk ->
                     ZFile.openReadOnly(resourcesApk).use { resourcesApkZFile ->
-                        // Delete all resources in the target APK before merging the new ones.
-                        // This is necessary because the resources.apk renames resources.
-                        // So unless, the old resources are deleted, there will be orphaned resources in the APK.
-                        // It is not necessary, but for the sake of cleanliness, it is done.
-                        targetApkZFile.entries().filter { entry ->
-                            entry.centralDirectoryHeader.name.startsWith(RES_PREFIX)
-                        }.forEach(StoredEntry::delete)
-
+                        // Deliberately no blanket deletion of the target's res/ entries here.
+                        //
+                        // The encoder only writes resources.apk entries it actually had to rebuild;
+                        // everything it could reuse verbatim is left in the target APK, so deleting
+                        // res/ wholesale would throw away exactly the entries we avoided rebuilding.
+                        // mergeFrom below replaces the ones that were rebuilt.
+                        //
+                        // A renamed resource leaves its old entry behind as dead weight rather than
+                        // breaking anything, since the rebuilt table only refers to the new name.
+                        // Resources genuinely staged for removal are handled by deleteResources.
 
                         targetApkZFile.mergeFrom(resourcesApkZFile) { entry ->
                             // Filter any dex files in case they were packaged inside resources.apk for some reason.
