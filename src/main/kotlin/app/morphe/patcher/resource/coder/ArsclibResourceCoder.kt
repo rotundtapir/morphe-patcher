@@ -43,6 +43,7 @@ import java.io.File
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
 import java.util.logging.Logger
+import java.util.zip.ZipFile
 
 /**
  * A mobile country code and a mobile network code are three digits, so a device never reports one
@@ -61,6 +62,15 @@ private const val SPARSE_ENTRIES_MIN_SDK = 26
  * Outside the directories the encoder scans, so that it never sees them.
  */
 private const val PATCHED_CONFIGURATIONS_DIRECTORY = "patched-configurations"
+
+/** Sub-directory of the working directory holding the decoded resources of each package. */
+private const val RESOURCES_DIR = "resources"
+
+/** Sub-directory of the working directory holding everything that is not a resource. */
+private const val ROOT_DIR = "root"
+
+/** The resource table, which is always rebuilt and so never reused from the original APK. */
+private const val TABLE_FILE_NAME = "resources.arsc"
 
 internal class ArsclibResourceCoder(
     internal val workingDir: File,
@@ -324,6 +334,7 @@ internal class ArsclibResourceCoder(
                 loadedModule.setPreferredFramework(lazyPackageInfo.value.frameworkVersion)
                 encoder.scanDirectory(workingDir)
                 loadedModule.encodePatchedConfigurations(patchedConfigurations)
+                dropUnchangedPassthroughEntries(loadedModule)
                 loadedModule.writeApk(outputApk)
             }
         } finally {
@@ -332,6 +343,64 @@ internal class ArsclibResourceCoder(
         }
 
         return outputApk
+    }
+
+    /**
+     * Removes entries from [module] that would be written out byte for byte identical to the ones
+     * already in [apkFile], so the encoder does not spend time serialising them again. Writing an
+     * entry costs a few milliseconds regardless of its size, and an APK of this kind carries many
+     * thousands, so most of the encode goes on reproducing bytes that already exist - patching
+     * YouTube reuses around eleven thousand of its sixteen thousand entries this way.
+     * [PatcherResult.applyTo] leaves the corresponding entries of the target APK in place.
+     *
+     * Only *opaque* entries qualify - images, assets, native libraries. Binary XML is excluded even
+     * when its source on disk is untouched, because the resource table it refers to is rebuilt:
+     * resource ids are reassigned and the package may be renamed, so its encoded form legitimately
+     * changes. Anything a patch wrote is excluded too.
+     */
+    private fun dropUnchangedPassthroughEntries(module: ApkModule) {
+        val modifiedNames = modifiedEntryNames()
+        val originalEntries = HashSet<String>()
+        ZipFile(apkFile).use { zip ->
+            val entries = zip.entries()
+            while (entries.hasMoreElements()) {
+                originalEntries.add(entries.nextElement().name)
+            }
+        }
+
+        var dropped = 0
+        module.zipEntryMap.removeIf { inputSource ->
+            val name = inputSource.alias ?: inputSource.name
+            val keep = name == null ||
+                name.endsWith(".xml") ||
+                name == TABLE_FILE_NAME ||
+                name.startsWith("META-INF/") ||
+                name in modifiedNames ||
+                name !in originalEntries
+            if (!keep) dropped++
+            !keep
+        }
+        logger.info("Reusing $dropped unchanged entries from the original APK")
+    }
+
+    /** APK entry names that patches added or modified, so they must be written by the encoder. */
+    private fun modifiedEntryNames(): Set<String> {
+        val names = HashSet<String>()
+        val workingDirPath = workingDir.absoluteFile.invariantSeparatorsPath
+
+        fun add(file: File, stripAfter: String) {
+            val path = file.absoluteFile.invariantSeparatorsPath.replace(workingDirPath, "")
+            val subPath = if (stripAfter == RESOURCES_DIR) {
+                path.substringAfter("/$RESOURCES_DIR/").substringAfter("/")
+            } else {
+                path.substringAfter("/$stripAfter/")
+            }
+            names.add(pathMap.getOriginalName(subPath) ?: subPath)
+        }
+
+        modifiedResResources.forEach { add(it, RESOURCES_DIR) }
+        modifiedBinaryResources.forEach { add(it, ROOT_DIR) }
+        return names
     }
 
     /**
