@@ -108,11 +108,65 @@ internal class PatchClasses internal constructor(
     internal fun closeStringMap() {
         stringMap = null
         allClassesWithStrings = null
+        signatureMap = null
     }
 
     internal fun addClass(classDef: ClassDef) {
         classMap[classDef.type] = ClassDefWrapper(classDef)
     }
+
+    /**
+     * Method return type and parameter count -> the classes declaring such a method.
+     *
+     * A fingerprint with neither a string literal nor a defining class has nothing to narrow on, so
+     * resolving it means walking every class. Many also constrain the return type and parameter
+     * count of the method they are looking for, which is what this indexes.
+     *
+     * Expect a modest win rather than a large one. Only a fingerprint that declares parameters *and*
+     * compares the return type for equality can use the index at all, and how much it narrows
+     * depends on how common the signature is: the median bucket holds roughly an eighth of the
+     * app's classes, but a signature as ordinary as `void` with no parameters matches nearly two
+     * thirds of them. Everything that cannot use the index still walks every class, and on a
+     * YouTube-sized target that full walk remains the larger half of fingerprint resolution.
+     *
+     * Built lazily and, exactly like [stringMap], not rebuilt when a patch adds a class. That is
+     * safe because this only ever *narrows* a search: a caller that finds no match here still falls
+     * back to walking every class, which sees whatever the class map holds at that moment. A stale
+     * or incomplete index therefore costs a little speed and can never cause a wrong or missed
+     * match.
+     */
+    private var signatureMap: Map<String, List<ClassDefWrapper>>? = null
+
+    /** Key into [signatureMap], or null for a signature that cannot be indexed. */
+    private fun signatureKey(returnType: String?, parameterCount: Int) =
+        if (returnType == null) null else "$returnType/$parameterCount"
+
+    private fun getSignatureMap(): Map<String, List<ClassDefWrapper>> {
+        signatureMap?.let { return it }
+
+        val map = HashMap<String, MutableList<ClassDefWrapper>>()
+        classMap.values.forEach { wrapper ->
+            var keys: MutableSet<String>? = null
+            wrapper.classDef.methods.forEach { method ->
+                val key = signatureKey(method.returnType, method.parameters.size) ?: return@forEach
+                if (keys == null) keys = HashSet()
+                keys!!.add(key)
+            }
+            keys?.forEach { key ->
+                map.getOrPut(key) { ArrayList(1) } += wrapper
+            }
+        }
+
+        signatureMap = map
+        return map
+    }
+
+    /**
+     * Classes declaring at least one method with the given return type and parameter count, in class
+     * map order, or null when the signature cannot be indexed.
+     */
+    internal fun getClassesBySignature(returnType: String?, parameterCount: Int) =
+        signatureKey(returnType, parameterCount)?.let { getSignatureMap()[it] }
 
     internal fun getClassesByStringMap(): Map<String, List<ClassDefWrapper>> {
         if (stringMap != null) {

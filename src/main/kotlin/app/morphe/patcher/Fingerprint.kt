@@ -294,6 +294,24 @@ open class Fingerprint private constructor(
             }
         }
 
+        // Narrow by the method signature before resorting to every class. This only ever reduces
+        // the candidate set, and a miss falls through to the full walk below, so an index that does
+        // not yet know about a class a patch just added costs a little speed and nothing else.
+        // parametersMatch requires the parameter counts to be equal whatever the per-parameter
+        // comparison types are, so the count is always safe to index on. The return type only is
+        // when it is compared for equality rather than, say, a suffix.
+        val parametersLocal = parameters
+        if (parametersLocal != null && returnTypeComparison == StringComparisonType.EQUALS) {
+            patchContext.patchClasses
+                .getClassesBySignature(returnType, parametersLocal.size)
+                ?.forEach { candidate ->
+                    val value = machAllClassMethods(candidate)
+                    if (value != null) {
+                        return value
+                    }
+                }
+        }
+
         // Check all classes.
         patchContext.patchClasses.classMap.values.forEach { value ->
             val value = machAllClassMethods(value)
