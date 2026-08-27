@@ -20,6 +20,7 @@ import app.morphe.patcher.resource.processor.PackageRenamingProcessor
 import app.morphe.patcher.resource.processor.ResourceIdProcessor
 import app.morphe.patcher.resource.processor.StringsXmlEscapeProcessor
 import app.morphe.patcher.resource.processor.StringsXmlSanitizeProcessor
+import app.morphe.patcher.resource.processor.StringsXmlStyledSplitProcessor
 import app.morphe.patcher.resource.processor.StringsXmlUnEscapeProcessor
 import app.morphe.patcher.util.Document
 import app.morphe.patcher.util.FileUtils.safelyDelete
@@ -327,6 +328,10 @@ internal class ArsclibResourceCoder(
         }
 
         val patchedConfigurations = stashPatchedConfigurations()
+
+        // The encoder DOM-loads every strings.xml to preload styled strings, which is quadratic
+        // in the number of strings per file. Move the plain strings out of its way first.
+        StringsXmlStyledSplitProcessor(packageDirectories).process()
 
         try {
             val encoder = ApkModuleXmlEncoder()
