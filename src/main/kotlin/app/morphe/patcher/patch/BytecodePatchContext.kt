@@ -25,10 +25,15 @@ import app.morphe.patcher.util.proxy.mutableTypes.MutableClass
 import com.android.tools.smali.dexlib2.Opcodes
 import com.android.tools.smali.dexlib2.iface.ClassDef
 import com.android.tools.smali.dexlib2.iface.reference.MethodReference
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.runBlocking
 import java.io.Closeable
 import java.io.File
 import java.io.InputStream
 import java.util.logging.Logger
+import kotlin.math.min
 
 /**
  * A context for patches containing the current state of the bytecode.
@@ -40,6 +45,14 @@ class BytecodePatchContext internal constructor(private val config: PatcherConfi
     PatchContext<Set<PatcherResult.PatchedDexFile>>,
     Closeable {
     private val logger = Logger.getLogger(this::class.java.name)
+
+    private companion object {
+        /**
+         * Upper bound on the number of original DEX files stripped concurrently
+         * by [compileStripFast]. Matches the bound used for parallel DEX writing.
+         */
+        private const val MAX_STRIP_THREADS = 4
+    }
 
     override val fileWorkspace = config.fileWorkspace
 
@@ -57,7 +70,7 @@ class BytecodePatchContext internal constructor(private val config: PatcherConfi
      * read and before the file is rewritten, renamed, or deleted, so the deterministic
      * unmapping releases any Windows file lock in time for those operations.
      */
-    private var originalDexMappings: MutableMap<File, MappedFile> = HashMap()
+    private var originalDexMappings: MutableMap<File, MappedFile> = LinkedHashMap()
 
     /**
      * Class descriptors that existed in the original APK (before any extensions or patches).
@@ -94,7 +107,10 @@ class BytecodePatchContext internal constructor(private val config: PatcherConfi
         classDescriptorsByEntry = readResult.classDescriptorsByEntry
         patchClasses = PatchClasses(readResult.dexFile.classes)
 
-        originalDexMappings = HashMap<File, MappedFile>(readResult.mappedFiles.size).apply {
+        // Insertion-ordered so iteration follows the original classes*.dex order; a plain
+        // HashMap iterates in File-hash order, which varies with the temporary directory
+        // path and makes STRIP_SAFE's output file naming nondeterministic.
+        originalDexMappings = LinkedHashMap<File, MappedFile>(readResult.mappedFiles.size).apply {
             readResult.mappedFiles.forEachIndexed { index, mappedFile ->
                 put(mappedFile.originalFile, mappedFile)
             }
@@ -360,12 +376,40 @@ class BytecodePatchContext internal constructor(private val config: PatcherConfi
         }
 
         // 2. Strip modified class_def entries from original DEX files in-place.
+        // Each file is fully independent (its own memory mapping), so the files are
+        // stripped in parallel. Files that contain no modified classes are skipped
+        // entirely using the class-descriptor index built at decode time.
         if (modifiedOriginalDescriptors.isNotEmpty()) {
             logger.info("Stripping ${modifiedOriginalDescriptors.size} modified classes from original DEX files")
-            originalDexMappings.forEach { (originalDex, mappedFile) ->
-                val stripped = DexStripper.stripInPlace(mappedFile, modifiedOriginalDescriptors)
-                if (stripped > 0) {
-                    logger.fine { "Stripped $stripped class_def entries from ${originalDex.name}" }
+
+            val mappingsToStrip = originalDexMappings.entries.filter { (originalDex, _) ->
+                classDescriptorsByEntry[originalDex.name]
+                    ?.any { it in modifiedOriginalDescriptors }
+                    ?: true // Unknown entry: strip defensively.
+            }
+
+            if (mappingsToStrip.size <= 1) {
+                mappingsToStrip.forEach { (originalDex, mappedFile) ->
+                    val stripped = DexStripper.stripInPlace(mappedFile, modifiedOriginalDescriptors)
+                    if (stripped > 0) {
+                        logger.fine { "Stripped $stripped class_def entries from ${originalDex.name}" }
+                    }
+                }
+            } else {
+                val parallelism = min(
+                    mappingsToStrip.size,
+                    min(Runtime.getRuntime().availableProcessors(), MAX_STRIP_THREADS),
+                )
+                val dispatcher = Dispatchers.Default.limitedParallelism(parallelism)
+                runBlocking(dispatcher) {
+                    mappingsToStrip.map { (originalDex, mappedFile) ->
+                        async {
+                            val stripped = DexStripper.stripInPlace(mappedFile, modifiedOriginalDescriptors)
+                            if (stripped > 0) {
+                                logger.fine { "Stripped $stripped class_def entries from ${originalDex.name}" }
+                            }
+                        }
+                    }.awaitAll()
                 }
             }
         }
@@ -414,7 +458,9 @@ class BytecodePatchContext internal constructor(private val config: PatcherConfi
         }
 
         // 2. For each original DEX file, either pass through or rebuild without modified classes.
-        originalDexMappings.keys.forEachIndexed { i, originalDex ->
+        // Iterate over a snapshot: releaseDexMapping() removes entries from originalDexMappings
+        // while this loop runs, which would otherwise throw ConcurrentModificationException.
+        originalDexMappings.keys.toList().forEachIndexed { i, originalDex ->
             val entryDescriptors = classDescriptorsByEntry[originalDex.name] ?: emptySet()
             val hasModifiedClasses = entryDescriptors.any { it in modifiedOriginalDescriptors }
 
