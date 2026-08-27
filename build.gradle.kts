@@ -165,3 +165,13 @@ signing {
     useGpgCmd()
     sign(publishing.publications["morphe-patcher-publication"])
 }
+
+// Benchmark harness for encode-side scanDirectory profiling (not shipped, manual invocation only).
+tasks.register<JavaExec>("scanBench") {
+    group = "verification"
+    classpath = sourceSets["test"].runtimeClasspath
+    mainClass.set("app.morphe.patcher.bench.ScanBenchKt")
+    maxHeapSize = "2g"
+    args = (project.findProperty("scanBenchArgs") as String?)?.split(" ") ?: emptyList()
+    jvmArgs = (project.findProperty("scanBenchJvmArgs") as String?)?.split(" ") ?: emptyList()
+}
