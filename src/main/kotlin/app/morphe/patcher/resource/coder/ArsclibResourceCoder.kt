@@ -31,6 +31,8 @@ import com.reandroid.apk.ApkModuleXmlDecoder
 import com.reandroid.apk.ApkModuleXmlEncoder
 import com.reandroid.archive.block.ApkSignatureBlock
 import com.reandroid.arsc.chunk.PackageBlock
+import com.reandroid.arsc.chunk.TableBlock
+import com.reandroid.arsc.chunk.xml.ResXmlDocument
 import com.reandroid.arsc.coder.CoderSetting
 import com.reandroid.arsc.coder.xml.AaptXmlStringDecoder
 import com.reandroid.arsc.coder.xml.XmlCoder
@@ -89,6 +91,39 @@ internal class ArsclibResourceCoder(
     internal data class FileSnapshot(val lastModified: Long, val size: Long)
     internal var fileSnapshotCache: Map<File, FileSnapshot> = emptyMap()
     internal var pathMap: PathMap = PathMap.EMPTY
+
+    /**
+     * Decoded file paths whose content was never extracted from the APK. [decodeResources] writes
+     * zero-byte placeholders for them, [materializePending] fills one in the moment a patch asks
+     * for it through [getFile], and [encodeResources] copies the untouched rest into the output
+     * APK straight from the original archive.
+     */
+    internal val pendingFiles = mutableMapOf<File, PendingResourceFile>()
+
+    /**
+     * The original APK, reopened lazily to materialize [pendingFiles] from. Kept open between
+     * accesses because the resource table it carries is expensive to load; released before
+     * encoding begins, when memory is needed the most.
+     */
+    private var lazyOriginalModule: ApkModule? = null
+
+    /**
+     * The resource table of [lazyOriginalModule], once it has been loaded and its resource names
+     * validated the way the decoder did.
+     */
+    private var lazyOriginalTable: TableBlock? = null
+
+    /**
+     * The [XmlCoder] setting that was active while resources were decoded. [XmlCoder] is a
+     * process-wide singleton and [encodeResources] reconfigures it, so a binary XML decoded late
+     * must be decoded under the setting of the decode phase to come out identical.
+     */
+    private var decodeCoderSetting: CoderSetting? = null
+
+    /**
+     * How many placeholders were filled in on demand, for the log.
+     */
+    private var materializedCount = 0
 
     /**
      * Recursively scan the working directory and build a map of file paths to their metadata.
@@ -210,13 +245,14 @@ internal class ArsclibResourceCoder(
 
     override fun decodeResources(): PackageMetadata {
         ApkModule.loadApkFile(apkFile).use { apkModule ->
-            val xmlDecoder = ApkModuleXmlDecoder(apkModule).also {
+            val xmlDecoder = PlaceholderApkModuleXmlDecoder(apkModule, pendingFiles).also {
                 it.setKeepResPath(false)
             }
 
             xmlDecoder.setDexDecoder { _, _ -> }
             xmlDecoder.dexProfileDecoder = null
             xmlDecoder.decode(workingDir)
+            decodeCoderSetting = XmlCoder.getInstance().setting
 
             // Update ARSCLib package metadata so the resources will be accessible under the correct package name.
             workingDir.resolve("resources").listFiles { it.isDirectory }?.forEach { dir ->
@@ -267,10 +303,119 @@ internal class ArsclibResourceCoder(
         }
     }
 
+    /**
+     * Fill in the content of [file] if it is a placeholder [decodeResources] left behind, or of
+     * every placeholder underneath it if [file] is a directory a patch asked for.
+     */
+    @Synchronized
+    internal fun materializePending(file: File) {
+        if (pendingFiles.isEmpty()) return
+
+        val key = file.absoluteFile
+        pendingFiles.remove(key)?.let { pending ->
+            materialize(key, pending)
+            return
+        }
+
+        if (key.isDirectory) {
+            val prefix = key.invariantSeparatorsPath + "/"
+            pendingFiles.keys
+                .filter { it.invariantSeparatorsPath.startsWith(prefix) }
+                .forEach { pendingFile ->
+                    pendingFiles.remove(pendingFile)?.let { materialize(pendingFile, it) }
+                }
+        }
+    }
+
+    private fun materialize(file: File, pending: PendingResourceFile) {
+        materializedCount++
+        val module = lazyOriginalModule
+            ?: ApkModule.loadApkFile(apkFile).also { lazyOriginalModule = it }
+        val inputSource = module.zipEntryMap.getInputSource(pending.originalPath)
+            ?: throw PatchException("Entry ${pending.originalPath} not found in $apkFile")
+
+        if (pending.isBinaryXml) {
+            val tableBlock = lazyOriginalTable ?: run {
+                // The decoder validated (and where needed renamed) resource names before it
+                // decoded anything, so references resolve to the same names here.
+                ApkModuleXmlDecoder(module).validateResourceNames()
+                module.tableBlock.also { lazyOriginalTable = it }
+            }
+            val document = ResXmlDocument()
+            document.readBytes(inputSource.openStream())
+            if (document.packageBlock == null) {
+                document.packageBlock = tableBlock.pickOne(pending.packageId)
+                    ?: tableBlock.pickOne()
+            }
+            val xmlCoder = XmlCoder.getInstance()
+            val currentSetting = xmlCoder.setting
+            decodeCoderSetting?.let { xmlCoder.setting = it }
+            try {
+                val serializer = XMLFactory.newSerializer(file, document.encoding)
+                document.serialize(serializer)
+                serializer.flush()
+            } finally {
+                xmlCoder.setting = currentSetting
+            }
+        } else {
+            inputSource.write(file)
+        }
+    }
+
+    private fun releaseLazyOriginalModule() {
+        lazyOriginalModule?.close()
+        lazyOriginalModule = null
+        lazyOriginalTable = null
+    }
+
+    /**
+     * Drops [pendingFiles] whose placeholder no longer exists on disk, because a patch deleted it
+     * or [stripNativeLibraries] removed it.
+     */
+    private fun purgeDeletedPendingFiles() {
+        pendingFiles.keys.retainAll { it.isFile }
+    }
+
+    /**
+     * Replaces the encoder inputs of files that are still zero-byte placeholders with the
+     * corresponding entries of the original APK, so their content is copied over in its original
+     * (compressed) form instead of being read off disk. Runs after `scanDirectory`, which is also
+     * after the encoder restored the original archive paths from path-map.json, so [pendingFiles]
+     * original paths match the entry names of [encodedModule].
+     *
+     * @return The original [ApkModule], which must stay open until the output APK is written.
+     */
+    private fun reusePendingOriginalEntries(encodedModule: ApkModule): ApkModule? {
+        if (pendingFiles.isEmpty()) return null
+
+        val originalModule = ApkModule.loadApkFile(apkFile)
+        val unmatched = mutableListOf<String>()
+        pendingFiles.forEach { (_, pending) ->
+            val original = originalModule.zipEntryMap.getInputSource(pending.originalPath)
+            if (original == null || !encodedModule.zipEntryMap.contains(pending.originalPath)) {
+                unmatched += pending.originalPath
+                return@forEach
+            }
+            encodedModule.zipEntryMap.add(original)
+        }
+        if (unmatched.isNotEmpty()) {
+            // Better to fail than to write the zero-byte placeholders into the APK.
+            originalModule.close()
+            throw PatchException(
+                "${unmatched.size} unread resource files could not be taken from the original " +
+                        "APK, first: ${unmatched.take(5)}"
+            )
+        }
+
+        logger.info("Reusing ${pendingFiles.size} unread entries of the original APK")
+        return originalModule
+    }
+
     override fun encodeResources(outputDir: File): File {
         val outputApk = outputDir.resolve("resources.apk")
 
         stripNativeLibraries()
+        purgeDeletedPendingFiles()
 
         // TODO: We could potentially remove unused resource splits here as well
 
@@ -289,6 +434,15 @@ internal class ArsclibResourceCoder(
                 packageDirectories,
             ).process()
 
+            if (originalPackageName != newPackageName) {
+                // PackageRenamingProcessor rewrites resource XMLs of every package other than the
+                // one being renamed, so placeholders there must be filled in first.
+                packageDirectories.filter { it.key != originalPackageName }
+                    .forEach { (_, packageDirectory) ->
+                        materializePending(packageDirectory.resolve("res"))
+                    }
+            }
+
             PackageRenamingProcessor(
                 this@ArsclibResourceCoder::getFile,
                 publicXmlManager,
@@ -304,12 +458,19 @@ internal class ArsclibResourceCoder(
             ).process()
 
             // Process all XMLs to ensure we have IDs generated for each one.
+            // Only lists directories and reads values files and modified files, none of which are
+            // placeholders, so it must not fill the whole res directory in.
             ResourceIdProcessor(
-                this@ArsclibResourceCoder::getFile,
+                { path -> resolveFile(path) },
                 publicXmlManager,
                 modifiedResResources
             ).process()
         }
+
+        // Patches are done reading; free the reopened original APK before the encoder needs the
+        // memory. The unread entries are reopened once more, without the resource table, below.
+        releaseLazyOriginalModule()
+        logger.info("$materializedCount resource files were decoded on demand")
 
         logger.info("Writing resource APK")
         XmlCoder.getInstance().setting = CoderSetting().also {
@@ -324,7 +485,13 @@ internal class ArsclibResourceCoder(
                 loadedModule.setPreferredFramework(lazyPackageInfo.value.frameworkVersion)
                 encoder.scanDirectory(workingDir)
                 loadedModule.encodePatchedConfigurations(patchedConfigurations)
-                loadedModule.writeApk(outputApk)
+
+                val originalModule = reusePendingOriginalEntries(loadedModule)
+                try {
+                    loadedModule.writeApk(outputApk)
+                } finally {
+                    originalModule?.close()
+                }
             }
         } finally {
             patchedConfigurations.forEach { it.restore() }
@@ -597,7 +764,14 @@ internal class ArsclibResourceCoder(
         path: String,
         packageName: String?,
         copy: Boolean,
-    ): File {
+    ): File = resolveFile(path, packageName).also { materializePending(it) }
+
+    /**
+     * Resolve [path] to its location in the working directory without filling in a placeholder.
+     * For internal processing that only needs to list directories or that only reads files known
+     * to be decoded; anything a patch gets goes through [getFile] instead.
+     */
+    internal fun resolveFile(path: String, packageName: String? = null): File {
         val pkgName = packageName ?: lazyPackageInfo.value.packageName
 
         val aliasedPath = pathMap.getAlias(path) ?: path
@@ -626,6 +800,7 @@ internal class ArsclibResourceCoder(
         val pkgName = packageName ?: lazyPackageInfo.value.packageName
         val destFile =
             packageDirectories[pkgName]?.resolve(destPath) ?: throw PatchException("Package $pkgName not found")
+        pendingFiles.remove(destFile.absoluteFile)
         Files.copy(srcFile.toPath(), destFile.toPath(), StandardCopyOption.REPLACE_EXISTING)
 
         return destFile
@@ -635,10 +810,13 @@ internal class ArsclibResourceCoder(
         val pkgName = packageName ?: lazyPackageInfo.value.packageName
         val file = packageDirectories[pkgName]?.resolve(path) ?: throw PatchException("Package $pkgName not found")
 
+        pendingFiles.remove(file.absoluteFile)
         Files.deleteIfExists(file.toPath())
     }
 
     override fun close() {
+        releaseLazyOriginalModule()
+        pendingFiles.clear()
         packageDirectories.clear()
         modifiedResResources.clear()
         modifiedBinaryResources.clear()
