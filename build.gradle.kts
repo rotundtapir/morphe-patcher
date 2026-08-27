@@ -30,6 +30,24 @@ tasks {
         testLogging { exceptionFormat = TestExceptionFormat.FULL }
     }
 
+    // Benchmark of the DEX write phase (BytecodePatchContext.get()).
+    // Usage: ./gradlew dexWriteBench -PbenchApk=/path/to/app.apk [-PbenchMode=STRIP_FAST]
+    //        [-PbenchReps=3] [-PbenchHeap=2g] [-PbenchModifyEvery=40]
+    register<JavaExec>("dexWriteBench") {
+        group = "verification"
+        description = "Benchmarks the DEX write phase against a given APK."
+        classpath = sourceSets["test"].runtimeClasspath
+        mainClass.set("app.morphe.patcher.bench.DexWriteBench")
+        maxHeapSize = (project.findProperty("benchHeap") as String?) ?: "2g"
+        args(
+            project.findProperty("benchApk") as String? ?: "",
+            project.findProperty("benchMode") as String? ?: "STRIP_FAST",
+            project.findProperty("benchReps") as String? ?: "3",
+            layout.buildDirectory.dir("dexWriteBench").get().asFile.absolutePath,
+            project.findProperty("benchModifyEvery") as String? ?: "40",
+        )
+    }
+
     jacocoTestReport {
         dependsOn(test)
         reports {
