@@ -91,6 +91,9 @@ kotlin {
 }
 
 tasks.withType<Test> {
+    // Allow benchmarks (e.g. DecodeBenchmark) to request a larger test JVM heap.
+    System.getenv("TEST_MAX_HEAP")?.let { maxHeapSize = it }
+
     // Allow running the test suite against a specific JDK (e.g. -PtestJavaVersion=11)
     // while Gradle itself keeps running on JDK 17+. Used by CI to verify the library
     // works across the JDK versions it supports.
