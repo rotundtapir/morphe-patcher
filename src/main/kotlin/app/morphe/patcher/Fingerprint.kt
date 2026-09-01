@@ -224,6 +224,9 @@ open class Fingerprint private constructor(
     private fun cachedMatchOrNull(): Match? {
         val cached = _matchOrNull ?: return null
         if (!preResolved) return cached
+        // Accesses during the pre-resolution phase itself (a fingerprint resolving its class
+        // fingerprint, for instance) are not the first use by a patch, so they do not settle it.
+        if (patchContext.preResolvingFingerprints) return cached
         val current = patchContext.patchClasses.classMap[cached.originalClassDef.type]?.classDef
         preResolved = false
         if (current === cached.originalClassDef) return cached
@@ -232,12 +235,13 @@ open class Fingerprint private constructor(
     }
 
     /**
-     * Resolve this fingerprint ahead of patch execution, see [app.morphe.patcher.patch.BytecodePatchBuilder.fingerprints].
+     * Mark a match produced while the patcher pre-resolves fingerprints, so its first use by a
+     * patch checks that the class is still unchanged. See [cachedMatchOrNull].
      */
     context(patchContext: BytecodePatchContext)
-    internal fun preResolve() {
-        if (_matchOrNull != null) return
-        if (matchOrNull() != null) preResolved = true
+    private fun Match?.markPreResolved(): Match? {
+        if (this != null && patchContext.preResolvingFingerprints) preResolved = true
+        return this
     }
 
     /**
@@ -257,6 +261,11 @@ open class Fingerprint private constructor(
     context(patchContext: BytecodePatchContext)
     fun matchOrNull(): Match? {
         cachedMatchOrNull()?.let { return it }
+        return resolveOrNull().markPreResolved()
+    }
+
+    context(patchContext: BytecodePatchContext)
+    private fun resolveOrNull(): Match? {
 
         // Must check first.
         val classFingerprintLocal = classFingerprint

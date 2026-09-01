@@ -136,6 +136,10 @@ class BytecodePatchContext internal constructor(private val config: PatcherConfi
      */
     private val mergedExtensionProviders = HashSet<Supplier<out Iterable<Supplier<InputStream>>>>()
 
+    /** True while the patcher resolves declared fingerprints ahead of execution. */
+    @Volatile
+    internal var preResolvingFingerprints = false
+
     /**
      * Merge the extension of [bytecodePatch] into the [BytecodePatchContext].
      * Each extension provider is merged once.
