@@ -340,15 +340,23 @@ open class OpcodesFilter protected constructor(
 
 
 class LiteralFilter internal constructor(
-    val literal: () -> Long,
+    literalOrNull: () -> Long?,
     opcodes: List<Opcode>? = null,
     location: InstructionLocation
 ) : OpcodesFilter(opcodes, location) {
 
     /**
      * Store the lambda value instead of calling it more than once.
+     * `null` means the literal does not exist in this app and the filter never matches.
      */
-    internal val literalValue: Long by lazy(literal)
+    internal val literalValue: Long? by lazy(literalOrNull)
+
+    /**
+     * The literal this filter matches.
+     *
+     * @throws IllegalStateException If the literal was declared with [literal] and does not exist.
+     */
+    val literal: () -> Long = { literalValue ?: error("Literal does not exist in this app") }
 
     override fun matches(
         enclosingMethod: Method,
@@ -390,7 +398,7 @@ fun literal(
     literal: Int,
     opcodes: List<Opcode>? = null,
     location: InstructionLocation = InstructionLocation.MatchAfterAnywhere()
-) = LiteralFilter({ literal.toLong() }, opcodes, location)
+) = LiteralFilter({ literal.toLong()}, opcodes, location)
 
 /**
  * Double point literal. Automatically converts literal to opcode hex.
@@ -404,7 +412,7 @@ fun literal(
     literal: Double,
     opcodes: List<Opcode>? = null,
     location: InstructionLocation = InstructionLocation.MatchAfterAnywhere()
-) = LiteralFilter({ literal.toRawBits() }, opcodes, location)
+) = LiteralFilter({ literal.toRawBits()}, opcodes, location)
 
 /**
  * Floating point literal. Automatically converts literal to opcode hex.
@@ -421,15 +429,20 @@ fun literal(
 ) = LiteralFilter({ literal.toRawBits().toLong() }, opcodes, location)
 
 /**
- * Literal number value. Automatically converts the provided number to opcode hex.
+ * Literal number value that is only known once matching starts, such as a resource id looked up
+ * from the decoded resources. The lambda is evaluated once, when the fingerprint is first matched.
+ * Returning `null` means the literal does not exist in this app and the filter never matches.
  *
- * @param literal Literal number.
+ * Declaring resource ids this way (instead of a custom [InstructionFilter]) lets the patcher
+ * use its literal index to find candidate classes instead of scanning every class.
+ *
+ * @param literal Lazily evaluated literal number, or `null` if it does not exist.
  * @param opcodes Opcodes to match. By default this matches any literal number opcode such as:
  *                [Opcode.CONST_4], [Opcode.CONST_16], [Opcode.CONST], [Opcode.CONST_WIDE].
  * @param location Where this filter is allowed to match. Default is anywhere after the previous instruction.
  */
 fun literal(
-    literal: () -> Long,
+    literal: () -> Long?,
     opcodes: List<Opcode>? = null,
     location: InstructionLocation = InstructionLocation.MatchAfterAnywhere()
 ) = LiteralFilter(literal, opcodes, location)

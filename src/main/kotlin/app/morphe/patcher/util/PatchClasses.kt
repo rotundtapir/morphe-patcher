@@ -20,6 +20,7 @@ import com.android.tools.smali.dexlib2.iface.reference.MethodReference
 import com.android.tools.smali.dexlib2.iface.reference.StringReference
 import com.android.tools.smali.dexlib2.iface.reference.TypeReference
 import java.util.LinkedList
+import java.util.stream.Collectors
 
 /**
  * All classes for the target app and any extension classes.
@@ -49,6 +50,9 @@ internal class PatchClasses internal constructor(
         /** Sorted literal values used by instructions in this class. */
         var literalValues: LongArray? = null
 
+        /** Sorted hashes of the names of the methods declared by this class. */
+        var methodNameHashes: IntArray? = null
+
         fun getMutableClass(): MutableClass {
             if (classDef !is MutableClass) {
                 classDef = MutableClass(classDef)
@@ -61,12 +65,14 @@ internal class PatchClasses internal constructor(
         val strings: MutableSet<String> = HashSet(),
         val referencedTypeHashes: MutableSet<Int> = HashSet(),
         val literalValues: MutableSet<Long> = HashSet(),
+        val methodNameHashes: MutableSet<Int> = HashSet(),
     )
 
     /** Collect string, type-reference, and literal values in one traversal. */
     private fun ClassDef.findIndexValues(): ClassIndexValues {
         val values = ClassIndexValues()
         methods.forEach { method ->
+            values.methodNameHashes += method.name.hashCode()
             method.instructionsOrNull?.forEach { instruction ->
                 if (instruction is WideLiteralInstruction) {
                     values.literalValues += instruction.wideLiteral
@@ -126,6 +132,7 @@ internal class PatchClasses internal constructor(
         classMap.values.forEach { wrapper ->
             wrapper.referencedTypeHashes = null
             wrapper.literalValues = null
+            wrapper.methodNameHashes = null
         }
     }
 
@@ -146,8 +153,16 @@ internal class PatchClasses internal constructor(
         val strings = HashMap<String, MutableList<ClassDefWrapper>>()
         val classesWithStrings = mutableListOf<ClassDefWrapper>()
 
-        classMap.values.forEach { wrapper ->
-            val values = wrapper.classDef.findIndexValues()
+        // Decoding every instruction of every class is the expensive part and is independent
+        // per class, so it runs in parallel. The merge below runs in class map order, so the
+        // per-string lists keep the deterministic ordering fingerprint matching relies on.
+        val wrappers = classMap.values.toList()
+        val indexValues = wrappers.parallelStream()
+            .map { wrapper -> wrapper.classDef.findIndexValues() }
+            .collect(Collectors.toList())
+
+        wrappers.forEachIndexed { index, wrapper ->
+            val values = indexValues[index]
             if (values.strings.isNotEmpty()) {
                 values.strings.forEach { stringLiteral ->
                     strings.getOrPut(stringLiteral) { ArrayList(1) } += wrapper
@@ -163,6 +178,11 @@ internal class PatchClasses internal constructor(
                 EMPTY_LITERAL_VALUES
             } else {
                 values.literalValues.sorted().toLongArray()
+            }
+            wrapper.methodNameHashes = if (values.methodNameHashes.isEmpty()) {
+                EMPTY_TYPE_HASHES
+            } else {
+                values.methodNameHashes.sorted().toIntArray()
             }
         }
 
@@ -187,6 +207,16 @@ internal class PatchClasses internal constructor(
             val hashes = wrapper.referencedTypeHashes
             // Mutable and newly added classes may have changed since indexing.
             hashes == null || wrapper.classDef is MutableClass || hashes.binarySearch(typeHash) >= 0
+        }.ifEmpty { null }
+    }
+
+    internal fun getClassesWithMethodName(name: String): List<ClassDefWrapper>? {
+        getClassesByStringMap() // All instruction indexes are built in the same traversal.
+        val nameHash = name.hashCode()
+        return classMap.values.filter { wrapper ->
+            val hashes = wrapper.methodNameHashes
+            // Mutable and newly added classes may have changed since indexing.
+            hashes == null || wrapper.classDef is MutableClass || hashes.binarySearch(nameHash) >= 0
         }.ifEmpty { null }
     }
 

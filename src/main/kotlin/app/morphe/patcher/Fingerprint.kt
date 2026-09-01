@@ -639,6 +639,13 @@ open class Fingerprint private constructor(
             }
         }
 
+        // An exact defining class names the only class that can match.
+        val definingClassLocal = definingClass
+        if (definingClassLocal != null && definingClassComparison == StringComparisonType.EQUALS) {
+            patchContext.patchClasses.classMap[definingClassLocal]?.let(::machAllClassMethods)
+            return matches.ifEmpty { null }
+        }
+
         // If using built-in filters and not using anyFilter, and contain String literals,
         // then can speed up matching by only checking classes with matching strings.
         if (filters?.all { BUNDLED_INSTRUCTION_FILTERS.contains(it::class)} == true) {
@@ -667,10 +674,13 @@ open class Fingerprint private constructor(
                 return matches.distinctBy(Match::originalMethod)
             }
 
-            instructionFilterCandidates()?.let { candidates ->
-                candidates.forEach(::machAllClassMethods)
-                return matches.distinctBy(Match::originalMethod).ifEmpty { null }
-            }
+        }
+
+        // Indexed candidates are exhaustive whatever other filters are declared: every filter must
+        // match inside the same method, so its class must contain the indexed value.
+        instructionFilterCandidates()?.let { candidates ->
+            candidates.forEach(::machAllClassMethods)
+            return matches.distinctBy(Match::originalMethod).ifEmpty { null }
         }
 
         // Check all classes.
@@ -683,8 +693,14 @@ open class Fingerprint private constructor(
 
     context(patchContext: BytecodePatchContext)
     private fun instructionFilterCandidates(): List<PatchClasses.ClassDefWrapper>? {
-        val filters = filters ?: return null
-        val candidateSets = filters.mapNotNull { filter -> filter.indexedCandidatesOrNull() }
+        val candidateSets = ArrayList<Set<PatchClasses.ClassDefWrapper>>()
+        filters?.forEach { filter -> filter.indexedCandidatesOrNull()?.let(candidateSets::add) }
+
+        // A method name narrows the search as well. Constructor names are in nearly every class.
+        val nameLocal = name
+        if (nameLocal != null && nameLocal != "<init>" && nameLocal != "<clinit>") {
+            candidateSets += patchContext.patchClasses.getClassesWithMethodName(nameLocal).orEmpty().toSet()
+        }
         if (candidateSets.isEmpty()) return null
 
         val smallestCandidates = candidateSets.minBy { it.size }
@@ -696,7 +712,8 @@ open class Fingerprint private constructor(
         is AnyInstruction -> filters.map { filter ->
             filter.indexedCandidatesOrNull() ?: return null
         }.flatten().toSet()
-        is LiteralFilter -> patchContext.patchClasses.getClassesContainingLiteral(literalValue).orEmpty().toSet()
+        // A literal that does not exist in this app cannot match anywhere.
+        is LiteralFilter -> literalValue?.let { patchContext.patchClasses.getClassesContainingLiteral(it) }.orEmpty().toSet()
         else -> exactReferencedTypesOrNull()?.flatMap { type ->
             patchContext.patchClasses.getClassesReferencingType(type).orEmpty()
         }?.toSet()
