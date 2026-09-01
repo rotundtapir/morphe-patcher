@@ -26,6 +26,7 @@ import app.morphe.patcher.util.FileUtils.safelyDelete
 import app.morphe.patcher.util.FileUtils.safelyMoveTo
 import com.android.tools.build.apkzlib.zip.ZFile
 import com.reandroid.apk.ApkModule
+import com.reandroid.archive.InputSource
 import com.reandroid.apk.ApkModuleRawDecoder
 import com.reandroid.apk.ApkModuleXmlDecoder
 import com.reandroid.apk.ApkModuleXmlEncoder
@@ -43,6 +44,7 @@ import java.io.File
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
 import java.util.logging.Logger
+import kotlin.time.measureTime
 
 /**
  * A mobile country code and a mobile network code are three digits, so a device never reports one
@@ -492,9 +494,27 @@ internal class ArsclibResourceCoder(
             val encoder = ApkModuleXmlEncoder()
             encoder.apkModule.use { loadedModule ->
                 loadedModule.setPreferredFramework(lazyPackageInfo.value.frameworkVersion)
-                encoder.scanDirectory(workingDir)
+                val scanDuration = measureTime {
+                    encoder.scanDirectory(workingDir)
+                }
                 loadedModule.encodePatchedConfigurations(patchedConfigurations)
-                loadedModule.writeApk(outputApk)
+
+                ApkModule.loadApkFile(apkFile).use { originalModule ->
+                    val changedEntries = changedArchiveEntries(originalPackageName != newPackageName)
+                    val reusedEntries = reuseUnchangedArchiveEntries(originalModule, loadedModule, changedEntries)
+                    val rebuiltEntries = loadedModule.zipEntryMap.listInputSources().size - reusedEntries
+
+                    logger.info(
+                        "Resource APK inputs: reusing $reusedEntries unchanged archive entries, " +
+                                "rebuilding $rebuiltEntries entries",
+                    )
+
+                    val writeDuration = measureTime {
+                        loadedModule.writeApk(outputApk)
+                    }
+
+                    logger.info("Resource APK timings: scan=$scanDuration, write=$writeDuration")
+                }
             }
         } finally {
             patchedConfigurations.forEach { it.restore() }
@@ -646,6 +666,71 @@ internal class ArsclibResourceCoder(
     private fun qualifiersOf(resourceDirectory: File): String {
         val separator = resourceDirectory.name.indexOf('-')
         return if (separator > 0) resourceDirectory.name.substring(separator) else ""
+    }
+
+    /**
+     * Returns original APK entry names which must be rebuilt from the decoded resource tree.
+     */
+    internal fun changedArchiveEntries(packageRenamed: Boolean): Set<String> = buildSet {
+        add("AndroidManifest.xml")
+        add("resources.arsc")
+
+        modifiedResResources.forEach { file ->
+            packageDirectories.values.firstNotNullOfOrNull { packageDirectory ->
+                file.archivePathRelativeToOrNull(packageDirectory)
+            }?.let(::add)
+        }
+
+        modifiedBinaryResources.forEach { file ->
+            file.archivePathRelativeToOrNull(otherResourcesRootDirectory)?.let(::add)
+        }
+
+        // PackageRenamingProcessor may rewrite resource XMLs which patches did not directly touch.
+        // Rebuild all compiled resources when that processor ran, while still reusing unchanged APK-root files.
+        if (packageRenamed) {
+            packageDirectories.values.forEach { packageDirectory ->
+                packageDirectory.resolve("res").walkTopDown().filter { it.isFile }.forEach { file ->
+                    file.archivePathRelativeToOrNull(packageDirectory)?.let(::add)
+                }
+            }
+        }
+    }
+
+    /**
+     * Replaces unchanged filesystem-backed encoder inputs with archive-backed inputs from [originalModule].
+     * ARSCLib can raw-copy those entries in their existing compressed form instead of reopening and recompressing
+     * every extracted file.
+     */
+    internal fun reuseUnchangedArchiveEntries(
+        originalModule: ApkModule,
+        encodedModule: ApkModule,
+        changedEntries: Set<String>,
+    ): Int {
+        val encodedEntries = encodedModule.zipEntryMap
+        var reusedEntries = 0
+
+        originalModule.zipEntryMap.listInputSources().forEach { originalSource: InputSource ->
+            val entryName = originalSource.alias
+            // Adapted for the current decode: native libraries are no longer staged, so they are
+            // absent from the encoder's map. Reusing only entries already present would drop them
+            // from the swapped output base, so unchanged entries are added whether present or not.
+            // Entries a patch deleted are excluded by applyTo's deletion pass as before.
+            if (entryName !in changedEntries) {
+                encodedEntries.add(originalSource)
+                reusedEntries++
+            }
+        }
+
+        return reusedEntries
+    }
+
+    private fun File.archivePathRelativeToOrNull(baseDirectory: File): String? {
+        val filePath = absoluteFile.toPath().normalize()
+        val basePath = baseDirectory.absoluteFile.toPath().normalize()
+        if (!filePath.startsWith(basePath)) return null
+
+        val alias = basePath.relativize(filePath).toString().replace(File.separatorChar, '/')
+        return pathMap.getOriginalName(alias) ?: alias
     }
 
     override fun getOtherResourceFiles(outputDir: File, resourceMode: ResourceMode): File? {
