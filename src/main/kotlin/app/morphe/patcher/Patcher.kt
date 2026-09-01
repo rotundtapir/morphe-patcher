@@ -185,17 +185,19 @@ class Patcher(private val config: PatcherConfig) : Closeable {
         val threads = Runtime.getRuntime().availableProcessors().coerceIn(1, MAX_RESOLVE_THREADS)
         logger.info("Resolving ${fingerprints.size} fingerprints of ${bytecodePatches.size} patches on $threads threads")
         val pool = ForkJoinPool(threads)
+        bytecodeContext.preResolvingFingerprints = true
         try {
             pool.submit {
                 fingerprints.parallelStream().forEach { fingerprint ->
                     try {
-                        with(bytecodeContext) { fingerprint.preResolve() }
+                        with(bytecodeContext) { fingerprint.matchOrNull() }
                     } catch (_: Exception) {
                         // Resolved again, and reported, by the patch that uses it.
                     }
                 }
             }.get()
         } finally {
+            bytecodeContext.preResolvingFingerprints = false
             pool.shutdown()
         }
     }

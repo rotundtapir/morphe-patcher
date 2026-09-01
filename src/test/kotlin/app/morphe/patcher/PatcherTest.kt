@@ -78,6 +78,7 @@ internal object PatcherTest {
 
             every { context.bytecodeContext.patchClasses } returns mockk(relaxed = true)
             every { context.bytecodeContext.decodeDexFiles() } just runs
+            every { context.bytecodeContext.preResolvingFingerprints } returns false
             every { this@mockk() } answers { callOriginal() }
         }
     }
