@@ -168,11 +168,14 @@ open class Fingerprint private constructor(
 
     // Holds a reference to all constructed fingerprints so that they can be later cleared.
     internal companion object {
-        private val fingerprintList = mutableListOf<WeakReference<Fingerprint>>()
+        // Fingerprints may be constructed and resolved from several threads.
+        private val fingerprintList = java.util.Collections.synchronizedList(mutableListOf<WeakReference<Fingerprint>>())
 
         fun clearFingerprints() {
-            fingerprintList.forEach { it.get()?.clearMatch() }
-            fingerprintList.clear()
+            synchronized(fingerprintList) {
+                fingerprintList.forEach { it.get()?.clearMatch() }
+                fingerprintList.clear()
+            }
         }
     }
 

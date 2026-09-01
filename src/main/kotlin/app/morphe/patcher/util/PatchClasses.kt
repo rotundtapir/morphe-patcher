@@ -39,6 +39,7 @@ internal class PatchClasses internal constructor(
          */
         var classDef: ClassDef,
     ) {
+        @Synchronized
         fun getMutableClass(): MutableClass {
             if (classDef !is MutableClass) {
                 classDef = MutableClass(classDef)
@@ -76,6 +77,7 @@ internal class PatchClasses internal constructor(
     /**
      * Opcode string constant -> List<ClassDefWrapper>
      */
+    @Volatile
     private var stringMap: Map<String, List<ClassDefWrapper>>? = null
 
     /**
@@ -115,9 +117,15 @@ internal class PatchClasses internal constructor(
     }
 
     internal fun getClassesByStringMap(): Map<String, List<ClassDefWrapper>> {
-        if (stringMap != null) {
-            return stringMap!!
+        stringMap?.let { return it }
+        // Fingerprints may be resolved concurrently, so the index is built once under a lock.
+        synchronized(this) {
+            stringMap?.let { return it }
+            return buildStringMap()
         }
+    }
+
+    private fun buildStringMap(): Map<String, List<ClassDefWrapper>> {
 
         // Default 0.75f load factor works well and a lower value does not improve patching time.
         val map = HashMap<String, MutableList<ClassDefWrapper>>()

@@ -13,6 +13,7 @@ import app.morphe.patcher.patch.*
 import app.morphe.patcher.resource.ResourceMode
 import kotlinx.coroutines.flow.flow
 import java.io.Closeable
+import java.util.concurrent.ForkJoinPool
 import java.util.logging.Logger
 
 /**
@@ -110,6 +111,7 @@ class Patcher(private val config: PatcherConfig) : Closeable {
 
         if (config.bytecodeMode != BytecodeMode.NONE) {
             context.bytecodeContext.decodeDexFiles()
+            preResolveFingerprints()
         }
 
         logger.info("Executing patches")
@@ -157,6 +159,50 @@ class Patcher(private val config: PatcherConfig) : Closeable {
                 emit(result)
             }
         }
+    }
+
+    /**
+     * Resolve the fingerprints that patches declared with [BytecodePatchBuilder.fingerprints]
+     * concurrently, before any patch executes. Resolution only reads the classes, and every
+     * extension known ahead of time is merged first so the class set is final. Patches then
+     * find their matches cached and execute in the usual order. Failures here are ignored:
+     * the patch resolves the fingerprint again on use and reports the error itself.
+     */
+    private fun preResolveFingerprints() {
+        val bytecodePatches = LinkedHashSet<BytecodePatch>()
+        fun collect(patch: Patch<*>) {
+            patch.dependencies.forEach(::collect)
+            if (patch is BytecodePatch) bytecodePatches += patch
+        }
+        context.executablePatches.forEach(::collect)
+
+        val fingerprints = bytecodePatches.flatMap { it.fingerprints }.distinct()
+        if (fingerprints.isEmpty()) return
+
+        val bytecodeContext = context.bytecodeContext
+        bytecodePatches.forEach { bytecodeContext.mergeExtension(it, eagerOnly = true) }
+
+        val threads = Runtime.getRuntime().availableProcessors().coerceIn(1, MAX_RESOLVE_THREADS)
+        logger.info("Resolving ${fingerprints.size} fingerprints of ${bytecodePatches.size} patches on $threads threads")
+        val pool = ForkJoinPool(threads)
+        try {
+            pool.submit {
+                fingerprints.parallelStream().forEach { fingerprint ->
+                    try {
+                        with(bytecodeContext) { fingerprint.matchOrNull() }
+                    } catch (_: Exception) {
+                        // Resolved again, and reported, by the patch that uses it.
+                    }
+                }
+            }.get()
+        } finally {
+            pool.shutdown()
+        }
+    }
+
+    private companion object {
+        /** Bounded: each concurrent scan decodes instructions, which costs heap on a phone. */
+        private const val MAX_RESOLVE_THREADS = 4
     }
 
     override fun close() = context.close()
