@@ -189,7 +189,7 @@ class Patcher(private val config: PatcherConfig) : Closeable {
             pool.submit {
                 fingerprints.parallelStream().forEach { fingerprint ->
                     try {
-                        with(bytecodeContext) { fingerprint.matchOrNull() }
+                        with(bytecodeContext) { fingerprint.preResolve() }
                     } catch (_: Exception) {
                         // Resolved again, and reported, by the patch that uses it.
                     }

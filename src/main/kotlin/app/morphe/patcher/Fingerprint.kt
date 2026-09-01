@@ -212,6 +212,35 @@ open class Fingerprint private constructor(
     private var _matchOrNull: Match? = null
 
     /**
+     * Set when [_matchOrNull] was produced by [preResolve], before any patch executed.
+     * Such a match is only handed out while its class is still the very object it was matched
+     * against. If a patch has since mutated (or an extension merge replaced) that class, the
+     * match is dropped and resolved again on use, exactly as a lazily resolved fingerprint
+     * sees the class at that time.
+     */
+    private var preResolved = false
+
+    context(patchContext: BytecodePatchContext)
+    private fun cachedMatchOrNull(): Match? {
+        val cached = _matchOrNull ?: return null
+        if (!preResolved) return cached
+        val current = patchContext.patchClasses.classMap[cached.originalClassDef.type]?.classDef
+        preResolved = false
+        if (current === cached.originalClassDef) return cached
+        _matchOrNull = null
+        return null
+    }
+
+    /**
+     * Resolve this fingerprint ahead of patch execution, see [app.morphe.patcher.patch.BytecodePatchBuilder.fingerprints].
+     */
+    context(patchContext: BytecodePatchContext)
+    internal fun preResolve() {
+        if (_matchOrNull != null) return
+        if (matchOrNull() != null) preResolved = true
+    }
+
+    /**
      * Clears the current match, forcing this fingerprint to resolve again.
      * This method should only be used if this fingerprint is re-used after it's modified,
      * and the prior match indexes are no longer correct.
@@ -219,6 +248,7 @@ open class Fingerprint private constructor(
     // TODO: On next major version bump change this to return the fingerprint.
     fun clearMatch() {
         _matchOrNull = null
+        preResolved = false
     }
 
     /**
@@ -226,7 +256,7 @@ open class Fingerprint private constructor(
      */
     context(patchContext: BytecodePatchContext)
     fun matchOrNull(): Match? {
-        if (_matchOrNull != null) return _matchOrNull
+        cachedMatchOrNull()?.let { return it }
 
         // Must check first.
         val classFingerprintLocal = classFingerprint
@@ -353,7 +383,7 @@ open class Fingerprint private constructor(
     ): Match? {
         checkClassFingerprintMatchesDefiningClass(classDef.type)
 
-        if (_matchOrNull != null) return _matchOrNull
+        cachedMatchOrNull()?.let { return it }
 
         for (method in classDef.methods) {
             val match = matchOrNull(method, classDef)
@@ -380,7 +410,7 @@ open class Fingerprint private constructor(
     ): Match? {
         checkClassFingerprintMatchesDefiningClass(method.definingClass)
 
-        if (_matchOrNull != null) return _matchOrNull
+        cachedMatchOrNull()?.let { return it }
 
         return matchOrNull(method, patchContext.classDefBy(method.definingClass))
     }
@@ -398,7 +428,7 @@ open class Fingerprint private constructor(
         method: Method,
         classDef: ClassDef
     ): Match? {
-        if (_matchOrNull != null) return _matchOrNull
+        cachedMatchOrNull()?.let { return it }
 
         // Store local to avoid duplicate field access and Kotlin intrinsic null check calls.
         val nameLocal = name
