@@ -2,6 +2,7 @@
 
 package app.morphe.patcher.patch
 
+import app.morphe.patcher.Fingerprint
 import app.morphe.patcher.Patcher
 import app.morphe.patcher.PatcherContext
 import app.morphe.patcher.dex.DexReadWrite
@@ -192,6 +193,11 @@ class BytecodePatch internal constructor(
     executeBlock: (BytecodePatchContext) -> Unit,
     finalizeBlock: ((BytecodePatchContext) -> Unit)?,
     availability: AvailabilityResolver? = null,
+    /**
+     * Fingerprints this patch matches with [Fingerprint.match] or its accessors.
+     * The patcher resolves them concurrently before any patch executes, see [BytecodePatchBuilder.fingerprints].
+     */
+    val fingerprints: Set<Fingerprint> = emptySet(),
 ) : Patch<BytecodePatchContext>(
     name,
     description,
@@ -255,6 +261,7 @@ class BytecodePatch internal constructor(
         extensionStreamProviders.firstOrNull()?.let { provider -> Supplier { provider.get().first().get() } }
 
     override fun execute(context: PatcherContext) = with(context.bytecodeContext) {
+        // Eager extensions are usually merged already, before fingerprints were pre-resolved.
         mergeExtension(this@BytecodePatch)
         execute(this)
     }
@@ -597,6 +604,17 @@ private fun <B : PatchBuilder<*>> B.buildPatch(block: B.() -> Unit = {}) = apply
  *
  * @constructor Create a new [BytecodePatchBuilder] builder.
  */
+/**
+ * An extension known when the patch is built, as opposed to one a provider derives at patch time.
+ * The patcher merges these before any patch executes, so fingerprints can be pre-resolved
+ * against the final set of classes.
+ */
+internal class EagerExtensionProvider(
+    private val extension: Supplier<InputStream>,
+) : Supplier<Iterable<Supplier<InputStream>>> {
+    override fun get(): Iterable<Supplier<InputStream>> = listOf(extension)
+}
+
 class BytecodePatchBuilder internal constructor(
     name: String?,
     description: String?,
@@ -615,6 +633,25 @@ class BytecodePatchBuilder internal constructor(
      * extensions are derived by a dependency patch that has already executed.
      */
     internal val extensionStreamProviders: MutableList<Supplier<out Iterable<Supplier<InputStream>>>> = mutableListOf()
+
+    internal val fingerprints: MutableSet<Fingerprint> = LinkedHashSet()
+
+    /**
+     * Declare the fingerprints this patch matches, so the patcher can resolve them
+     * concurrently before any patch executes. Resolution only reads the app's classes,
+     * so it is safe to run in parallel, while patches themselves still execute in order.
+     *
+     * Only declare fingerprints whose result does not depend on state that another patch
+     * sets while executing (for example a `custom` block reading a version flag that a
+     * dependency computes). Declaring is optional; an undeclared fingerprint is resolved
+     * on first use exactly as before. Only [Fingerprint.match] results are pre-resolved;
+     * [Fingerprint.matchAll] always searches again.
+     *
+     * @param fingerprints The fingerprints to resolve ahead of execution.
+     */
+    fun fingerprints(vararg fingerprints: Fingerprint) = apply {
+        this.fingerprints.addAll(fingerprints)
+    }
 
     // Inlining is necessary to get the class loader that loaded the patch
     // to load the extension from the resources.
@@ -671,12 +708,13 @@ class BytecodePatchBuilder internal constructor(
         extensionStreamProviders = buildList {
             // Each eager extension becomes a provider yielding a single stream, merged before the
             // patch-time providers registered with extendWithAll.
-            extensionInputStreams.forEach { extension -> add(Supplier { listOf(extension) }) }
+            extensionInputStreams.forEach { extension -> add(EagerExtensionProvider(extension)) }
             addAll(extensionStreamProviders)
         },
         executeBlock = executeBlock,
         finalizeBlock = finalizeBlock,
         availability = availability,
+        fingerprints = fingerprints.toSet(),
     )
 }
 

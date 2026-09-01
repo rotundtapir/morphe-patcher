@@ -53,6 +53,7 @@ internal class PatchClasses internal constructor(
         /** Sorted hashes of the names of the methods declared by this class. */
         var methodNameHashes: IntArray? = null
 
+        @Synchronized
         fun getMutableClass(): MutableClass {
             if (classDef !is MutableClass) {
                 classDef = MutableClass(classDef)
@@ -97,6 +98,7 @@ internal class PatchClasses internal constructor(
     /**
      * Opcode string constant -> List<ClassDefWrapper>
      */
+    @Volatile
     private var stringMap: Map<String, List<ClassDefWrapper>>? = null
 
     /**
@@ -141,9 +143,15 @@ internal class PatchClasses internal constructor(
     }
 
     internal fun getClassesByStringMap(): Map<String, List<ClassDefWrapper>> {
-        if (stringMap != null) {
-            return stringMap!!
+        stringMap?.let { return it }
+        // Fingerprints may be resolved concurrently, so the index is built once under a lock.
+        synchronized(this) {
+            stringMap?.let { return it }
+            return buildStringMap()
         }
+    }
+
+    private fun buildStringMap(): Map<String, List<ClassDefWrapper>> {
 
         return buildInstructionIndexes()
     }

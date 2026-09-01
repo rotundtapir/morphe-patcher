@@ -28,6 +28,7 @@ import com.android.tools.smali.dexlib2.iface.reference.MethodReference
 import java.io.Closeable
 import java.io.File
 import java.io.InputStream
+import java.util.function.Supplier
 import java.util.logging.Logger
 
 /**
@@ -133,8 +134,20 @@ class BytecodePatchContext internal constructor(private val config: PatcherConfi
      *
      * @param bytecodePatch The [BytecodePatch] to merge the extension of.
      */
-    internal fun mergeExtension(bytecodePatch: BytecodePatch) {
+    private val mergedExtensionProviders = HashSet<Supplier<out Iterable<Supplier<InputStream>>>>()
+
+    /**
+     * Merge the extension of [bytecodePatch] into the [BytecodePatchContext].
+     * Each extension provider is merged once.
+     *
+     * @param eagerOnly Merge only the extensions known when the patch was built, and leave
+     * providers that derive extensions at patch time (which may rely on a dependency having
+     * executed) for [BytecodePatch.execute].
+     */
+    internal fun mergeExtension(bytecodePatch: BytecodePatch, eagerOnly: Boolean = false) {
         bytecodePatch.extensionStreamProviders.forEach { provider ->
+            if (eagerOnly && provider !is EagerExtensionProvider) return@forEach
+            if (!mergedExtensionProviders.add(provider)) return@forEach
             provider.get().forEach { supplier ->
                 mergeExtensionStream(supplier.get())
             }
